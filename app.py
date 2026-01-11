@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime
 import json
+import os
+from pathlib import Path
 
 # Page configuration
 st.set_page_config(
@@ -10,21 +12,66 @@ st.set_page_config(
     layout="wide"
 )
 
+# Data persistence file
+DATA_FILE = "quiz_data.json"
+
+def load_data():
+    """Load data from file"""
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, 'r') as f:
+                data = json.load(f)
+                return data
+        except Exception as e:
+            st.error(f"Error loading data: {str(e)}")
+    return {
+        'teams': [],
+        'rounds': [],
+        'questions': {},
+        'scores': {}
+    }
+
+def save_data():
+    """Save data to file"""
+    try:
+        data = {
+            'teams': st.session_state.teams,
+            'rounds': st.session_state.rounds,
+            'questions': st.session_state.questions,
+            'scores': st.session_state.scores
+        }
+        with open(DATA_FILE, 'w') as f:
+            json.dump(data, f, indent=2)
+        return True
+    except Exception as e:
+        st.error(f"Error saving data: {str(e)}")
+        return False
+
 # Initialize session state
-if 'teams' not in st.session_state:
-    st.session_state.teams = []
-if 'rounds' not in st.session_state:
-    st.session_state.rounds = []
-if 'questions' not in st.session_state:
-    st.session_state.questions = {}
-if 'scores' not in st.session_state:
-    st.session_state.scores = {}
-if 'current_round' not in st.session_state:
+if 'initialized' not in st.session_state:
+    loaded_data = load_data()
+    st.session_state.teams = loaded_data.get('teams', [])
+    st.session_state.rounds = loaded_data.get('rounds', [])
+    st.session_state.questions = loaded_data.get('questions', {})
+    st.session_state.scores = loaded_data.get('scores', {})
     st.session_state.current_round = None
+    st.session_state.initialized = True
 
 def add_team(team_name):
     if team_name and team_name not in st.session_state.teams:
         st.session_state.teams.append(team_name)
+        save_data()
+        return True
+    return False
+
+def remove_team(team_name):
+    if team_name in st.session_state.teams:
+        st.session_state.teams.remove(team_name)
+        # Also remove from all rounds
+        for round_name in st.session_state.rounds:
+            if team_name in st.session_state.scores[round_name]['team_scores']:
+                del st.session_state.scores[round_name]['team_scores'][team_name]
+        save_data()
         return True
     return False
 
@@ -36,6 +83,7 @@ def add_round(round_name, qualifying_teams):
             'qualifying_teams': qualifying_teams,
             'team_scores': {}
         }
+        save_data()
         return True
     return False
 
@@ -47,6 +95,17 @@ def add_question(round_name, question_text, marks):
             'text': question_text,
             'marks': marks
         })
+        save_data()
+        return True
+    return False
+
+def remove_question(round_name, question):
+    if round_name in st.session_state.questions:
+        st.session_state.questions[round_name].remove(question)
+        # Reindex questions
+        for i, q in enumerate(st.session_state.questions[round_name], 1):
+            q['id'] = i
+        save_data()
         return True
     return False
 
@@ -77,10 +136,20 @@ def get_qualified_teams(round_name):
     
     return [r['team'] for r in rankings[:qualifying_count]]
 
+def save_scores(round_name, team_name, scores):
+    st.session_state.scores[round_name]['team_scores'][team_name] = scores
+    save_data()
+
 # Sidebar navigation
 st.sidebar.title("🎯 Quiz Dashboard")
+
+# Add data status indicator
+if os.path.exists(DATA_FILE):
+    file_time = datetime.fromtimestamp(os.path.getmtime(DATA_FILE))
+    st.sidebar.info(f"📊 Last saved: {file_time.strftime('%Y-%m-%d %H:%M:%S')}")
+
 page = st.sidebar.radio("Navigation", 
-                        ["Setup", "Manage Questions", "Score Entry", "Leaderboard", "Export Data"])
+                        ["Setup", "Manage Questions", "Score Entry", "Leaderboard", "Export/Reset"])
 
 # SETUP PAGE
 if page == "Setup":
@@ -109,45 +178,81 @@ if page == "Setup":
                     st.write(f"{i}. {team}")
                 with col_b:
                     if st.button("❌", key=f"del_team_{i}"):
-                        st.session_state.teams.remove(team)
+                        remove_team(team)
                         st.rerun()
     
     with col2:
         st.subheader("Round Management")
-        with st.form("add_round_form"):
-            round_name = st.text_input("Round Name")
-            
-            if st.session_state.rounds:
-                prev_round = st.selectbox(
-                    "Teams from previous round?",
-                    ["All Teams"] + st.session_state.rounds
-                )
-            else:
-                prev_round = "All Teams"
-            
-            qualifying_teams = st.number_input(
-                "Teams qualifying for next round (-1 for all)",
-                min_value=-1,
-                value=-1,
-                step=1
-            )
-            
-            submit_round = st.form_submit_button("Add Round")
-            
-            if submit_round:
-                if add_round(round_name, int(qualifying_teams)):
-                    if prev_round == "All Teams":
-                        participating_teams = st.session_state.teams.copy()
-                    else:
-                        participating_teams = get_qualified_teams(prev_round)
+        
+        if not st.session_state.teams:
+            st.warning("Please add teams first before creating rounds!")
+        else:
+            with st.form("add_round_form"):
+                round_name = st.text_input("Round Name")
+                
+                st.write("**Select Team Source:**")
+                if st.session_state.rounds:
+                    team_source = st.radio(
+                        "Choose teams from:",
+                        ["All Teams", "Previous Round Winners", "Custom Selection"],
+                        horizontal=True
+                    )
                     
-                    for team in participating_teams:
-                        st.session_state.scores[round_name]['team_scores'][team] = {}
-                    
-                    st.success(f"Round '{round_name}' added with {len(participating_teams)} teams!")
-                    st.rerun()
+                    if team_source == "Previous Round Winners":
+                        prev_round = st.selectbox(
+                            "Select previous round:",
+                            st.session_state.rounds
+                        )
                 else:
-                    st.error("Round already exists or invalid name")
+                    team_source = st.radio(
+                        "Choose teams from:",
+                        ["All Teams", "Custom Selection"],
+                        horizontal=True
+                    )
+                
+                # Team selection based on source
+                if team_source == "All Teams":
+                    available_teams = st.session_state.teams.copy()
+                    selected_teams = st.multiselect(
+                        "Participating Teams (all selected by default):",
+                        available_teams,
+                        default=available_teams
+                    )
+                elif team_source == "Custom Selection":
+                    available_teams = st.session_state.teams.copy()
+                    selected_teams = st.multiselect(
+                        "Select teams for this round:",
+                        available_teams
+                    )
+                else:  # Previous Round Winners
+                    qualified_teams = get_qualified_teams(prev_round)
+                    st.info(f"Qualified teams from {prev_round}: {', '.join(qualified_teams)}")
+                    selected_teams = st.multiselect(
+                        "Participating Teams:",
+                        qualified_teams,
+                        default=qualified_teams
+                    )
+                
+                qualifying_teams = st.number_input(
+                    "Teams qualifying for next round (-1 for all)",
+                    min_value=-1,
+                    value=-1,
+                    step=1
+                )
+                
+                submit_round = st.form_submit_button("Add Round")
+                
+                if submit_round:
+                    if not selected_teams:
+                        st.error("Please select at least one team for this round!")
+                    elif add_round(round_name, int(qualifying_teams)):
+                        for team in selected_teams:
+                            st.session_state.scores[round_name]['team_scores'][team] = {}
+                        save_data()
+                        st.success(f"Round '{round_name}' added with {len(selected_teams)} teams!")
+                        st.rerun()
+                    else:
+                        st.error("Round already exists or invalid name")
         
         if st.session_state.rounds:
             st.write("**Current Rounds:**")
@@ -173,9 +278,12 @@ elif page == "Manage Questions":
             submit_question = st.form_submit_button("Add Question")
             
             if submit_question:
-                if add_question(selected_round, question_text, int(marks)):
-                    st.success("Question added!")
-                    st.rerun()
+                if question_text.strip():
+                    if add_question(selected_round, question_text, int(marks)):
+                        st.success("Question added!")
+                        st.rerun()
+                else:
+                    st.error("Question text cannot be empty")
         
         st.divider()
         
@@ -189,7 +297,7 @@ elif page == "Manage Questions":
                     st.write(f"{q['text']} ({q['marks']} marks)")
                 with col3:
                     if st.button("🗑️", key=f"del_q_{selected_round}_{q['id']}"):
-                        st.session_state.questions[selected_round].remove(q)
+                        remove_question(selected_round, q)
                         st.rerun()
         else:
             st.info("No questions added yet for this round")
@@ -233,7 +341,7 @@ elif page == "Score Entry":
                     submit_scores = st.form_submit_button("Save Scores")
                     
                     if submit_scores:
-                        st.session_state.scores[selected_round]['team_scores'][selected_team] = scores
+                        save_scores(selected_round, selected_team, scores)
                         st.success(f"Scores saved for {selected_team}!")
                         st.rerun()
 
@@ -290,50 +398,68 @@ elif page == "Leaderboard":
         else:
             st.info("No scores entered yet for this round")
 
-# EXPORT DATA PAGE
-elif page == "Export Data":
-    st.title("Export Data")
+# EXPORT/RESET DATA PAGE
+elif page == "Export/Reset":
+    st.title("Export & Reset Data")
     
-    export_data = {
-        'teams': st.session_state.teams,
-        'rounds': st.session_state.rounds,
-        'questions': st.session_state.questions,
-        'scores': st.session_state.scores
-    }
+    col1, col2 = st.columns(2)
     
-    st.download_button(
-        label="Download Quiz Data (JSON)",
-        data=json.dumps(export_data, indent=2),
-        file_name=f"quiz_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-        mime="application/json"
-    )
-    
-    st.divider()
-    
-    st.subheader("Import Data")
-    uploaded_file = st.file_uploader("Upload Quiz Data (JSON)", type=['json'])
-    
-    if uploaded_file is not None:
-        if st.button("Import Data"):
-            try:
-                imported_data = json.load(uploaded_file)
-                st.session_state.teams = imported_data.get('teams', [])
-                st.session_state.rounds = imported_data.get('rounds', [])
-                st.session_state.questions = imported_data.get('questions', {})
-                st.session_state.scores = imported_data.get('scores', {})
-                st.success("Data imported successfully!")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Error importing data: {str(e)}")
-    
-    st.divider()
-    st.subheader("Summary Statistics")
-    
-    col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric("Total Teams", len(st.session_state.teams))
+        st.subheader("📥 Export Data")
+        
+        export_data = {
+            'teams': st.session_state.teams,
+            'rounds': st.session_state.rounds,
+            'questions': st.session_state.questions,
+            'scores': st.session_state.scores
+        }
+        
+        st.download_button(
+            label="Download Quiz Data (JSON)",
+            data=json.dumps(export_data, indent=2),
+            file_name=f"quiz_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+            mime="application/json"
+        )
+        
+        st.divider()
+        
+        st.subheader("📤 Import Data")
+        uploaded_file = st.file_uploader("Upload Quiz Data (JSON)", type=['json'])
+        
+        if uploaded_file is not None:
+            if st.button("Import Data"):
+                try:
+                    imported_data = json.load(uploaded_file)
+                    st.session_state.teams = imported_data.get('teams', [])
+                    st.session_state.rounds = imported_data.get('rounds', [])
+                    st.session_state.questions = imported_data.get('questions', {})
+                    st.session_state.scores = imported_data.get('scores', {})
+                    save_data()
+                    st.success("Data imported successfully!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error importing data: {str(e)}")
+    
     with col2:
-        st.metric("Total Rounds", len(st.session_state.rounds))
-    with col3:
+        st.subheader("📊 Summary Statistics")
+        
         total_questions = sum(len(questions) for questions in st.session_state.questions.values())
+        
+        st.metric("Total Teams", len(st.session_state.teams))
+        st.metric("Total Rounds", len(st.session_state.rounds))
         st.metric("Total Questions", total_questions)
+        
+        st.divider()
+        
+        st.subheader("⚠️ Reset Data")
+        st.warning("This will permanently delete all quiz data!")
+        
+        if st.button("🗑️ Reset All Data", type="primary"):
+            if st.checkbox("I understand this cannot be undone"):
+                st.session_state.teams = []
+                st.session_state.rounds = []
+                st.session_state.questions = {}
+                st.session_state.scores = {}
+                save_data()
+                st.success("All data has been reset!")
+                st.rerun()
